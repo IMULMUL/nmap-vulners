@@ -85,7 +85,7 @@ local nmap = require "nmap"
 local stdnse = require "stdnse"
 local os = require "os"
 
-local api_version="1.11"
+local api_version="1.12"
 local mincvss=stdnse.get_script_args(SCRIPT_NAME .. ".mincvss")
 mincvss = tonumber(mincvss) or 0.0
 
@@ -116,7 +116,7 @@ local cve_meta = {
 ---
 -- Return a string read from api_key_file to be used as an API_KEY
 --
-function read_api_key_file()
+local function read_api_key_file()
 
   stdnse.debug1("api_key not specified. Trying to read api_key_file.")
 
@@ -140,86 +140,15 @@ end
 
 
 ---
--- Return a string with all the found cve's and correspondent links
+-- Issues the requests, encapsulates logic of re-attempting when unsuccessfull initially.
 --
--- @param vulns a table list of vulnerabilities from the parsed json response from the vulners server
+-- @param api_endpoint URL path, where to call
+-- @param postbody json stringified body
 --
-function make_links(vulns)
-  local output = {}
-  local exploit_types = {"exploitdb", "githubexploit", "metasploit", "packetstorm"}
-
-  if not vulns then
-    return
-  end
-
-  for _, vuln in ipairs(vulns) do
-
-    local v = {
-      id = vuln.id,
-      type = vuln.type
-    }
-        -- Sometimes it might happen, so check the score availability
-    if vuln.metrics.cvss ~= nil then
-      v['cvss'] = vuln.metrics.cvss.score
-      v['cvss_type'] = "cvss" .. vuln.metrics.cvss.version
-    end
-
-    for _, ref in ipairs(vuln.enchantments.dependencies.references) do
-      for __, type in ipairs(exploit_types) do
-        if ref.type == type then
-          for ___, exploitId in ipairs(ref.idList) do
-            local expl = {
-              id = exploitId,
-              type = ref.type,
-              -- Mark the exploits out
-              is_exploit = true,
-              cvss = v.cvss,
-              cvss_type = v.cvss_type
-            }
-            setmetatable(expl, cve_meta)
-            output[#output+1] = expl
-          end
-          goto L2
-        end
-      end
-    end
-
-::L2::
-
-    -- NOTE[gmedian]: exploits seem to have cvss == 0, so print them anyway
-    if not v.cvss or (v.cvss == 0 and v.is_exploit) or mincvss <= v.cvss then
-      setmetatable(v, cve_meta)
-      output[#output+1] = v
-    end
-  end
-
-  if #output > 0 then
-    -- Sort the acquired vulns by the CVSS score
-    table.sort(output, function(a, b)
-        return a.cvss > b.cvss or (a.cvss == b.cvss and a.id > b.id)
-      end)
-    return output
-  end
-end
-
-
----
--- Issues the requests, receives json and parses it, calls <code>make_links</code> when successfull
---
--- @param what table, future value for the software query argument
---
-function get_results(what)
-  local api_endpoint = "/api/v4/audit/software/"
-  local vulns
+local function make_http_request(api_endpoint, postbody)
   local response
   local status
   local attempt_n=0
-  local postbody = {
-          software={what},
-          fields={'type', 'metrics', 'enchantments'}
-  }
-
-  -- local api_url = ('%s?%s'):format(api_endpoint, url.build_query(query))
   local option={
     header={
       ['User-Agent'] = string.format('Vulners NMAP Enterprise %s', api_version),
@@ -230,9 +159,7 @@ function get_results(what)
     any_af = true,
   }
 
-  postbody = json.generate(postbody)
-
-  stdnse.debug1("Trying to send data " .. postbody)
+  stdnse.debug1("Trying to send data to: " .. api_endpoint .. " with body: " .. postbody)
 
   -- Sometimes we cannot contact vulners, so have to try several more times
   while attempt_n < 3 do
@@ -249,11 +176,184 @@ function get_results(what)
   if status == nil then
     -- Something went really wrong out there
     -- According to the NSE way we will die silently rather than spam user with error messages
-    stdnse.debug1("Failed to contact vulners in several attempts.")
+    stdnse.debug1("Failed to contact vulners server in several attempts.")
     return
   elseif status ~= 200 then
     -- Again just die silently
     stdnse.debug1("Response from vulners is not 200 but " .. status)
+    return
+  end
+
+  return response
+end
+
+
+---
+-- Return a string with all the found cve's and correspondent links
+--
+-- @param vulns a table list of vulnerabilities from the parsed json response from the vulners server
+--
+local function make_links(vulns)
+  local output = {}
+  local id_list = {}
+  local exploit_types = {"exploitdb", "githubexploit", "metasploit", "packetstorm"}
+  local status
+  local response
+  local resp_body
+  local ID_CHUNK_SIZE=100
+
+  local function make_chunks(list, chunkSize)
+    local chunks = {}
+
+    for i = 1, #list, chunkSize do
+        local chunk = {}
+
+        for j = i, math.min(i + chunkSize - 1, #list) do
+            chunk[#chunk + 1] = list[j]
+        end
+
+        chunks[#chunks + 1] = chunk
+    end
+
+    return chunks
+  end
+
+
+  if not vulns then
+    return
+  end
+
+  for _, vuln in ipairs(vulns) do
+    id_list[#id_list+1] = vuln.id
+  end
+
+  -- Vulners ID API only accepts maximum 100 IDs in a single request
+  local chunks = make_chunks(id_list, ID_CHUNK_SIZE)
+
+  for _, chunk in ipairs(chunks) do
+    local postbody = {
+            id=chunk,
+            fields={'type', 'cvss', 'enchantments'}
+    }
+
+    stdnse.debug1("Sending IDs chunk #" .. _ .. " of size " .. #chunk)
+
+    postbody = json.generate(postbody)
+    response = make_http_request("/api/v3/search/id/", postbody)
+
+    if response == nil then
+      stdnse.debug1("Failed to check vulnerabilities ids, response from vulners was nil.")
+      goto continue
+    end
+
+    status, resp_body = json.parse(response.body)
+
+    if status == true then
+      stdnse.debug1("Have successfully parsed json response.")
+      if resp_body.result ~= "OK" or not (resp_body.data and resp_body.data.documents) then
+        stdnse.debug1("Response from vulners is not OK or empty with body:")
+        stdnse.debug1(response.body)
+        goto continue
+      end
+    else
+      stdnse.debug1("Unable to parse json.")
+      stdnse.debug1(response.body)
+      goto continue
+    end
+
+    stdnse.debug1("Response from vulners is OK.")
+    
+    for _, document in pairs(resp_body.data.documents) do 
+
+      local v = {
+        id = document.id,
+        type = document.type
+      }
+      
+      -- Sometimes it might happen, so check the score availability
+      if document.cvss ~= nil and document.cvss.version ~= "NONE" then
+        v['cvss'] = document.cvss.score
+        v['cvss_type'] = "cvss" .. document.cvss.version
+      end
+
+      for _, ref in ipairs(document.enchantments.dependencies.references) do
+        for __, type in ipairs(exploit_types) do
+          if ref.type == type then
+            for ___, exploitId in ipairs(ref.idList) do
+              local expl = {
+                id = exploitId,
+                type = ref.type,
+                -- Mark the exploits out
+                is_exploit = true,
+                cvss = v.cvss,
+                cvss_type = v.cvss_type
+              }
+              setmetatable(expl, cve_meta)
+              output[#output+1] = expl
+            end
+            goto L2
+          end
+        end
+      end
+
+      ::L2::
+
+      -- NOTE[gmedian]: exploits seem to have cvss == 0, so print them anyway
+      if not v.cvss or (v.cvss == 0 and v.is_exploit) or mincvss <= v.cvss then
+        setmetatable(v, cve_meta)
+        output[#output+1] = v
+      end
+    end
+  
+  -- If one chunk is not successfull, others might still be fine
+  ::continue::
+  end
+
+  stdnse.debug1("Result after ID chunks is " .. #output)
+
+  if #output > 0 then
+    -- Sort the acquired vulns by the CVSS score
+    table.sort(output, function(a, b)
+        return a.cvss > b.cvss or (a.cvss == b.cvss and a.id > b.id)
+      end)
+    return output
+  end
+end
+
+
+---
+-- Calls <code>make_http_request</code> for CPE audit, parses the response, calls <code>make_links</code> when successfull
+--
+-- @param what table, future value for the software query argument
+-- @param type str, either "software" or "cpe", determines the URL to call
+--
+local function get_results(what, type)
+  local api_endpoint
+  local vulns
+  local response
+  local status
+  -- local attempt_n=0
+  local postbody = {
+          software={what},
+          fields={'type', 'metrics', 'enchantments'}
+  }
+
+  if type == "cpe" then
+    api_endpoint = "/api/v4/audit/software/"
+  elseif type == "software" then
+    api_endpoint = "/api/v4/audit/smart"
+  else
+    stdnse.debug1("Unexpected request type.")
+    return
+  end
+
+
+  postbody = json.generate(postbody)
+  response = make_http_request(api_endpoint, postbody)
+
+  if response == nil then
+    -- According to the NSE way we will die silently rather than spam user with error messages
+    stdnse.debug1("Failed to check CPE, response from vulners was nil.")
     return
   end
 
@@ -283,12 +383,9 @@ end
 -- @param software string, the software name
 -- @param version string, the software version
 --
-function get_vulns_by_software(software, version)
-  local what = {
-    ['product'] = software,
-    ['version'] = version,
-  }
-  return get_results(what)
+local function get_vulns_by_software(software, version)
+  local what = software .. " " .. version
+  return get_results(what, "software")
 end
 
 
@@ -300,11 +397,10 @@ end
 --
 -- @param cpe string, the given cpe
 --
-function get_vulns_by_cpe(cpe)
+local function get_vulns_by_cpe(cpe)
   -- cpe:/a:openbsd:openssh:7.4
   -- local cpe_regexp=":([%d%.%-%_]+)([^:]*)$"
   local cpe_regexp="^cpe:/(%l):([^:]+):([^:]+):([%d%.%-%_]+)([^:]*)$"
-
 
   -- TODO[gmedian]: add check for cpe:/a  as we might be interested in software rather than in OS (cpe:/o) and hardware (cpe:/h)
   -- TODO[gmedian]: work not with the LAST part but simply with the THIRD one (according to cpe doc it must be version)
@@ -326,7 +422,7 @@ function get_vulns_by_cpe(cpe)
     ['update'] = update
   }
 
-  local output = get_results(what)
+  local output = get_results(what, "cpe")
 
   return output
 end
